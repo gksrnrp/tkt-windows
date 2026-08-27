@@ -1,0 +1,30 @@
+{
+  "name": "tkt",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "터미널에서 카카오톡 채팅방 하나를 주고받는 TUI",
+  "license": "MIT",
+  "bin": "./dist/cli.js",
+  "scripts": {
+    "dev": "npm run build:native && tsx src/cli.tsx",
+    "build": "npm run build:native && tsc",
+    "start": "npm run build:native && node dist/cli.js",
+    "build:native": "node scripts/build-native.mjs",
+    "doctor": "node scripts/doctor.mjs"
+  },
+  "dependencies": {
+    "ink": "^5.1.0",
+    "ink-text-input": "^6.0.0",
+    "react": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.18",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
