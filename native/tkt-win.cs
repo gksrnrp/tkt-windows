@@ -149,6 +149,12 @@ namespace Tkt
         [DllImport("user32.dll")]
         public static extern IntPtr GetOpenClipboardWindow();
 
+        // 클립보드를 열지 않고도 "내용이 바뀌었는지" 를 알 수 있다. 복사가 끝나기를 기다리며
+        // 클립보드를 계속 열어보면, 정작 카카오톡이 결과를 쓰려고 열 때 열지 못해 복사가
+        // 조용히 실패한다 (클립보드는 한 번에 한 프로세스만 연다).
+        [DllImport("user32.dll")]
+        public static extern uint GetClipboardSequenceNumber();
+
         [DllImport("kernel32.dll")]
         public static extern IntPtr GlobalLock(IntPtr handle);
 
@@ -896,6 +902,32 @@ namespace Tkt
             Win32.PostMessageW(control, message, new IntPtr(key), lParam);
         }
 
+        /// 빌려 쓴 클립보드를 원래 내용으로 되돌린다.
+        ///
+        /// 복사 직후의 클립보드는 붐빈다. 카카오톡이 막 쓰고 나갔고, Windows 클립보드 기록
+        /// 같은 감시자들이 새 내용을 읽으려고 곧바로 클립보드를 연다. 클립보드는 한 번에 한
+        /// 프로세스만 열 수 있어서, 한 번 시도하고 마는 구현에서는 열에 셋이 실패했다 —
+        /// 사용자가 복사해 둔 것이 대화 내용으로 덮인 채 그대로 남았다.
+        ///
+        /// 읽기는 몇 초마다 돌아오므로 여기서 오래 붙잡고 있을 수는 없다. 감시자들이 손을
+        /// 뗄 만큼만 기다렸다가 몇 번 더 두드린다.
+        private static void RestoreClipboard(string backup)
+        {
+            // 곧바로 달려들면 감시자들과 부딪힌다. 한 박자 쉰다.
+            Thread.Sleep(120);
+
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                if (attempt > 0) Thread.Sleep(150);
+                if (Clipboard.WriteText(backup)) return;
+            }
+
+            // 여기까지 왔으면 사용자가 복사해 둔 것이 대화 내용으로 덮인 채 남는다.
+            // 조용히 넘기지 않고 알린다.
+            Console.Error.WriteLine("경고: 클립보드를 원래 내용으로 되돌리지 못했습니다"
+                + Clipboard.Holder() + ".");
+        }
+
         /// 대화 목록을 통째로 복사해 문자열로 돌려준다.
         ///
         /// 카카오톡은 대화 내용을 접근성 트리(UI Automation·MSAA)에 전혀 내놓지 않는다.
@@ -916,34 +948,56 @@ namespace Tkt
                 return null;
             }
 
+            // 복사가 끝났는지는 클립보드를 열어보지 않고 일련번호로 판단한다.
+            //
+            // 예전에는 클립보드를 100ms 마다 열어보며 내용이 들어왔는지 확인했는데, 그 열기가
+            // 정작 카카오톡이 복사 결과를 쓰려고 여는 것을 막아서 여덟 번에 한 번꼴로 복사가
+            // 통째로 실패했다. 일련번호 조회는 클립보드를 열지 않으므로 서로 부딪히지 않는다.
+            //
+            // 비우는 것도 그만뒀다. 비우기 자체가 클립보드를 한 번 더 여는 데다, 일련번호가
+            // 바뀌었는지로 새 내용인지 가릴 수 있어서 이전 내용을 대화로 착각할 일이 없다.
+            uint before = Win32.GetClipboardSequenceNumber();
+            // 클립보드가 실제로 바뀌었을 때만 되돌린다. 손대지도 않았는데 덮어쓰면
+            // 그 사이 사용자가 복사해 둔 것을 우리가 지우는 꼴이 된다.
+            bool touched = false;
+
             try
             {
-                // 복사가 실패했는데 이전 내용이 남아 있으면 그걸 대화로 착각한다. 먼저 비운다.
-                Clipboard.WriteText(null);
-                Thread.Sleep(60);
-
-                if (!SendKeysTo(list, new int[] { Win32.VK_A, Win32.VK_C }, true))
+                // 한 번 놓쳤다고 바로 포기하지 않는다. 사용자에게 빨간 줄을 띄우는 것보다
+                // 조용히 한 번 더 해보는 편이 낫다.
+                for (int round = 0; round < 2; round++)
                 {
-                    failure = "대화 목록에 키 입력을 전달하지 못했습니다";
-                    return null;
+                    if (!SendKeysTo(list, new int[] { Win32.VK_A, Win32.VK_C }, true))
+                    {
+                        failure = "대화 목록에 키 입력을 전달하지 못했습니다";
+                        return null;
+                    }
+
+                    int emptyReads = 0;
+                    for (int waited = 0; waited < 30; waited++)
+                    {
+                        Thread.Sleep(50);
+                        uint now = Win32.GetClipboardSequenceNumber();
+                        if (now == before) continue;
+
+                        touched = true;
+                        before = now;
+
+                        // 번호가 올랐다고 내용이 다 실린 것은 아니다. 카카오톡은 클립보드를
+                        // 비우고(EmptyClipboard) 나서 내용을 쓰는데, 비우는 것만으로도 번호가
+                        // 오른다. 그 틈에 읽으면 빈 값을 본다. 잠깐 틈을 주고 읽는다.
+                        Thread.Sleep(80);
+
+                        string copied = Clipboard.ReadText();
+                        if (!string.IsNullOrEmpty(copied)) return copied;
+
+                        // 아직 쓰는 중이었다. 번호가 또 오르기를 기다린다.
+                        if (++emptyReads >= 4) break;
+                    }
                 }
 
-                // 복사는 비동기로 끝날 수 있다. 내용이 들어올 때까지 잠깐 기다린다.
-                string copied = "";
-                for (int attempt = 0; attempt < 12; attempt++)
-                {
-                    Thread.Sleep(100);
-                    copied = Clipboard.ReadText() ?? "";
-                    if (copied.Length > 0) break;
-                }
-
-                if (copied.Length == 0)
-                {
-                    failure = "대화 목록을 복사하지 못했습니다. 카카오톡 대화창에서 Ctrl+A → Ctrl+C 가 "
-                        + "동작하는지 직접 확인해 보세요. 동작하지 않는 버전이라면 이 방식으로는 읽을 수 없습니다.";
-                    return null;
-                }
-                return copied;
+                failure = "카카오톡이 복사 요청에 응답하지 않았습니다. 다음 차례에 다시 시도합니다.";
+                return null;
             }
             finally
             {
@@ -951,8 +1005,8 @@ namespace Tkt
                 //
                 // 예전에는 Ctrl+A 로 물든 선택을 지우려고 Esc 를 보냈는데, 카카오톡에서 Esc 는
                 // 채팅방 창을 닫는 키다. 읽기 한 번에 창이 사라지고, 그 뒤로는 "창이 없다 →
-                // open 시도 → 실패" 가 폴링마다 반복됐다. 선택 표시가 남는 편이 훨씬 낫다.
-                Clipboard.WriteText(backup);
+                // open 시도 → 실패" 가 폴링마다 반복됐다.
+                if (touched) RestoreClipboard(backup);
             }
         }
 
